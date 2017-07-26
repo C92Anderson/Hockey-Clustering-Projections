@@ -9,32 +9,81 @@ knitr::opts_chunk$set(echo = TRUE,  warning=FALSE, message=FALSE)
 ### Import packages
 library(ggplot2);library(dplyr); library(DataCombine)
 library(glmnet); library(nhlscrapr); library(caret); library(RMySQL); library(readr); library(reshape2); library(rvest)
-library(twitteR);library(httr); library(data.table);library(d3heatmap);
+library(twitteR);library(httr); library(data.table);library(d3heatmap); library(RColorBrewer); library(scales)
+
+set.seed(1234)
+
+
+## Custom Theme
+txt <- element_text(size = 18, colour = "grey25", face = "plain")
+bold_txt <- element_text(size = 20, colour = "navy", face = "bold")
+
+theme_standard <- function(base_size = 16, base_family = "") {
+  theme_bw(base_size = base_size, base_family = base_family) +
+    theme(
+      strip.background = element_blank(), 
+      
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_line( colour = "white", size = 2), 
+      
+      panel.background = element_rect(fill="grey90"),
+      plot.background = element_rect(fill="grey90"),
+      legend.background = element_rect(fill="grey90"),
+      legend.key = element_rect(fill="grey90", size = 20),
+      legend.key.size = unit(1,"cm"),
+      
+      panel.border = element_blank(), 
+      
+      line = element_line( colour = "white", size = 2),
+      axis.text.x = element_text(angle = 90, hjust = 1),
+      text = txt, 
+      plot.title = bold_txt, 
+      
+      axis.title = txt, 
+      axis.text = txt, 
+      
+      legend.title = bold_txt, 
+      legend.text = txt ) 
+}
 
 ```
 
+Hockey analytics has created a large array of statistics to measure player performance. How to properly weigh each of these to create a comprehensive overview of each player is not as widely discussed. Some, including myself, have tried to smartly roll them up into a single metric. However, possibly more appropriately, they can also be used to perform a clustering analysis, identifying player types.
 
-Hockey analytics has created a large array of statistics to measure player performance. How to properly weigh each of these to create a comprehensive overview of each player is not as widely discussed. Some, including myself, have tried to smartly roll them up into a single metric. However, possibly more appropriately, they can be used to performance a clustering analysis, identifying player style types.
+To do this, it helps to first reduce the number of features we have for each player. This is best done with Principal Components Analysis (PCA), which boils down all metrics into a few by creating a 'Principal Component' based on finding the maximum variability in the dataset. Then finding the second dimension of maximum variability, and so on.
 
-To properly to this, we must first reduce the number of features we have for each player. This is usually done with Principal Componenets Analysis (PCA), where the goal is to boil down all metrics into a few based on the variability each provide. Imagine our dataset had a metric that was 'Good in the Room / 60,' but since we didn't know anything about what happens in the room, every player is rated as a 10. This metric would offer zero variation and would be discarded. Scoring rates, on the other hand, vary greatly between players and would help make up the first principal componenet, calculated to have the largest possible variance. We do this a few more times until the rate of variance capture slows and are left with a few Principal Components
+![PCA aims captures as much variation in data as possible](https://sebastianraschka.com/images/faq/lda-vs-pca/pca.png)
 
-The smaller dataset can then be used to perform K-means clustering, identifying k player types based on the Principal Components.
+It also discards useless information. Imagine our dataset had a metric that was 'Good in the Room / 60,' but since we didn't know anything about what happens in the room, every player is rated as a 10. This metric would offer zero variation and would be discarded. Scoring rates, on the other hand, vary greatly between players and would help make up the first principal component, calculated to have the largest possible variance.
+
+The smaller dataset can then be used to perform K-means clustering, identifying 'k' different player types based on the principal components for each player-season.
+
+Note: This analysis is meant to combine some working knowledge of R (dplyr, subsetting), statistical tools (scaling), and hockey analytics. I try to comment code and explain as best I can, but am happy to handle any additional questions at cole92anderson@gmail.com or @crowdscoutsprts on twitter.
 
 ### 1. Data Preparation
 
+To re-create this analysis, <a href="http://www.crowdscoutsports.com/data_download.php"> download the data here.</a>
+
 ```{r}
+### Load Data from downloaded folder
+crowdscout_data_pred <- read.csv("~/Downloads/crowdscout_data_download.csv", header = TRUE)
 
-### Load Data
-load("~/Documents/CWA/Hockey Data/crowdscout.data.pred.scaled")
+### Look at column names (ignore that this analysis has already been done)
+colnames(crowdscout_data_pred)
 
-### Create position variables
-crowdscout.data.pred.pca <- crowdscout.data.pred.scaled %>% 
+### Create position variables and 
+crowdscout_data_pred_pca <- crowdscout_data_pred %>% 
         mutate(D = ifelse(Player.Position == "D",1,0),
                C = ifelse(Player.Position == "C",1,0),
-               W = ifelse(!Player.Position %in% c("C","D"),1,0))
+               W = ifelse(!Player.Position %in% c("C","D"),1,0),
+               Shooting_PP = G60_PP - ixG60_PP,
+               Shooting_EV = G60_EV - ixG60_EV,
+               Shooting_SH = G60_SH - ixG60_SH)
 
-### Identify variables to scale and performance PCA on
-pca.vars <- c("Total.Shifts_EV","Total.Shifts_PP","Total.Shifts_SH","OTF.Shift.Share_EV",
+### Identify variables to scale and performance PCA on.
+### Feel free to add other metrics based on columns available, or remove based on preference
+pca_vars <- c("Total.Shifts_EV","Total.Shifts_PP","Total.Shifts_SH","OTF.Shift.Share_EV",
               "OTF.Shift.Share_PP","OTF.Shift.Share_SH","Off.FO.Shift.Share_EV",
               "Off.FO.Shift.Share_PP","Off.FO.Shift.Share_SH",
               "Def.FO.Shift.Share_EV","Def.FO.Shift.Share_PP",
@@ -44,29 +93,30 @@ pca.vars <- c("Total.Shifts_EV","Total.Shifts_PP","Total.Shifts_SH","OTF.Shift.S
               "Player_Teammates_EV","Player_Teammates_PP","Share.of.Ice_EV",
               "Share.of.Ice_PP","Share.of.Ice_SH","xGF60_Rel_EV","xGF60_Rel_PP",
               "xGF60_Rel_SH","xGA60_Rel_EV","xGA60_Rel_PP","xGA60_Rel_SH","P60_EV","P60_PP",
-              "P60_SH","Teammates_Diff_EV","Teammates_Diff_PP","D","C","W")
+              "P60_SH","Teammates_Diff_EV","Teammates_Diff_PP","D","C","W",
+              "Shooting_PP","Shooting_EV","Shooting_SH")
               
 ```
 
 ### 2a. Create function to scale and center data by season
-To factor in changes in scoring over the course of the last decade, each season will be scaled separately
+To factor in changes in scoring or any other metric over the course of the last decade, each season will be scaled separately.
 
 ```{r}
 
-# Scale Each Season
-scale.season <- function(year) {
+# Create Function to Scale Each Season
+scale_season_function <- function(year) {
   
   ### Filter data to year
-  season.data <- crowdscout.data.pred.pca %>% 
+  season_data <- crowdscout_data_pred_pca %>% 
                       filter(season == year)
   
   ### Scale variables to be used in analysis for that season 
-  scaled_season <- scale(season.data[,pca.vars])
+  scaled_season <- scale(season_data[,pca_vars])
   
   ### Place scaled player level metrics next to player identifiers
-  season.scaled <- as.data.frame(cbind(season.data[,c("Player","shooterID","season","Pos","Predicted.CS")],scaled_season))
+  season_scaled <- as.data.frame(cbind(season_data[,c("Player","shooterID","season","Pos","Predicted.CS")],scaled_season))
   
-  return(season.scaled)
+  return(season_scaled)
     
 }
 
@@ -77,32 +127,32 @@ scale.season <- function(year) {
 ```{r}
 
 ## Find Unique Seasons in data
-seasons <- unique(crowdscout.data.pred.pca$season)
+seasons <- unique(crowdscout_data_pred_pca$season)
 
-## Scale Each Season Separately
-pca.data <- plyr::rbind.fill(lapply(FUN=scale.season,seasons))
+## Scale Each Season Separately, Stack Output into master PCA dataset
+pca_data <- plyr::rbind.fill(lapply(FUN=scale_season_function,seasons))
 
 ## Replace NAs with 0
-pca.data[is.na(pca.data[,pca.vars]),pca.vars] <- 0
+pca_data[is.na(pca_data[,pca_vars]),pca_vars] <- 0
 
 ## Create unique player season identifier
-id_vector <- as.vector(paste0(pca.data$Player,"-",substr(pca.data$season,7,8),"-",pca.data$shooterID))
+id_vector <- as.vector(paste0(pca_data$Player,"-",substr(pca_data$season,7,8),"-",pca_data$shooterID))
 
 ## Label rows as player ID
-rownames(pca.data) <- id_vector
+rownames(pca_data) <- id_vector
 
 ## Verify variance is uniform
-plot(sapply(pca.data[,pca.vars], var))
+plot(sapply(pca_data[,pca_vars], var))
 
 ```
 
 ### 3. Find Principal Components using Scree Plot
 
-Perform PCA Analysis to reduce size of data. We can reduce player metrics down in dimension by using the nFactors package  Ideally, we would try to explain a lot more of the variance, but there often trade offs involved in choosing the number of PCs to keep. There are graphical and non-graphical ways to determinte this (http://www.empowerstats.com/manuals/paper/scree.pdf#1) but general rules of thumbs are to have the eigenvalue greater than 1, and/or find an 'elbow' in the plot - a point where including another PC doesn't explain variance further.
+PCA Analysis is normally performed to reduce the size of data without losing information. We can reduce player metrics down in dimension by using the nFactors package. Ideally, we would try to explain a lot more of the variance, but there often trade offs involved in choosing the number of principal components (PCs) to keep. There are graphical and non-graphical ways to determine this (http://www.empowerstats.com/manuals/paper/scree.pdf#1) but general rules of thumbs are to have the eigenvalue greater than 1, and/or find an 'elbow' in the plot - a point where including another PC doesn't explain variance as much as the last PC.
 
-Parallel analysis works by creating a random dataset with the same numbers of observations and variables as the original data, we have set the parallel() function to run 100 times. A correlation matrix is computed from the randomly generated dataset and then eigenvalues of the correlation matrix are computed. When the eigenvalues from the random data are larger then the eigenvalues from the pca or factor analysis you known that the components or factors are mostly random noise.
+To determine the number of PCs to keep, we will also look at a Parallel Analysis of the dataset. Parallel analysis works by creating a random dataset with the same numbers of observations and variables as the original data, we have set the parallel() function below to run 100 times. A correlation matrix is computed from the randomly generated dataset and then eigenvalues of the correlation matrix are computed. When the eigenvalues from the random data are larger than the eigenvalues from the PCA or factor analysis it signals that the components or factors are mostly random noise, thus not to be included.
 
-We want to retain 13 PCs, or where PC eigenvalues are greater than the Parallel Analysis Eigenvalues averaged over 100 replications.
+Based on the Scree Plot and Parallel Analysis below, we want to retain 16 PCs - where PC eigenvalues are greater than the Parallel Analysis random eigenvalues averaged over 100 replications.
 
 ```{r}
 
@@ -110,11 +160,13 @@ We want to retain 13 PCs, or where PC eigenvalues are greater than the Parallel 
 library(nFactors)
 
 # Get eigenvalues
-ev <- eigen(cor(pca.data[,pca.vars])) 
+ev <- eigen(cor(pca_data[,pca_vars])) 
 
-
-ap <- parallel(subject=nrow(pca.data[,pca.vars]),var=ncol(pca.data[,pca.vars]),
+# Run parallel analysis 100 times, get output
+ap <- parallel(subject=nrow(pca_data[,pca_vars]),var=ncol(pca_data[,pca_vars]),
                rep=100,cent=.05)
+
+# Combine eigenvalues values and parallel analysis values and plot
 nS <- nScree(x=ev$values, aparallel=ap$eigen$qevpea)
 plotnScree(nS)
 
@@ -122,126 +174,203 @@ plotnScree(nS)
 
 ### 4. Limit dataset to most useful Principal Components & determine individual variables that make up each PC
 
-These 13 vectors contain scores for each player-season. We can pull the factor loadings from the 'pca' object and visualize which of our original on-ice metrics makeup each component. We can also take a look at what these components look like with player-seasons attached to them.
+These 16 vectors contain scores for each player-season. We can pull the factor loadings from the 'pca' object and visualize which of our original on-ice metrics make up each component. We can also take a look at what these components look like with player-seasons attached to them as an example. Note PC1 seems to be made up of metrics that puts some notable scorers near the top.
 
-```{r}
+```{r, fig.width=10,fig.height=11}
 ## Principal Components on data
-pca <- prcomp(pca.data[,pca.vars])
+pca <- prcomp(pca_data[,pca_vars])
 
 ## Create matrix of original variables by PCs
-loadings <- as.matrix(pca$rotation[,1:13])
+loadings <- as.matrix(pca$rotation[,1:16])
 
 ## Create dataframe of player-season level components
-comp <- data.frame(pca$x[,1:13])
+comp <- data.frame(pca$x[,1:16])
 
 ## Visualize component loadings, blue denotes metric is highly correlated with the PC. The component loadings are correlation coefficients between the variables (rows) and component (columns). Analogous to Pearson's r, the squared component loading is the percent of variance in that variable explained by the factor. (ftp://statgen.ncsu.edu/pub/thorne/molevoclass/AtchleyOct19.pdf)
 d3heatmap::d3heatmap(loadings, dendrogram = "none")
 
 ## Look at a sample of players and their PCs
-player.components <- cbind(pca.data[,c("Player","shooterID","season")], comp)
+player_components <- cbind(pca_data[,c("Player","shooterID","season")], comp)
 
-## Player with highest PC1
-player.components %>% arrange(-PC1) %>% head() %>% print()
+## Players with highest PC1
+player_components %>% arrange(-PC1) %>% head() %>% print()
 
 ```
 
 ### 5. Find optimal number of player clusters
 
-After reducing the number of features using the PCA, we can run the k-means algorithm. K-means is an unsupervised (we don't know what the class of the player are before hand) algorithm, clustering each player to the near mean or mathematical center of the cluster. To find the optimal number of clusters, we test each number the Within Group Sum of Squares (WSS) that best fit our PCs. To do this loop through 1 to 25 clusters measuring WSS. By definition add another cluster will lower WSS, so we look for the 'elbow' again where adding another cluster doesn't do much for us.
+After reducing the number of features using the PCA, we can run the k-means algorithm. K-means is an unsupervised (since we don't know what the cluster of each player is before hand) algorithm, clustering each player to the nearest mean or mathematical center of a cluster. To find the optimal number of clusters, we iteratively test different numbers of clusters and record their respective Within Group Sum of Squares (WSS). By definition adding another cluster will lower WSS, so we look for the 'elbow' again, where adding another cluster doesn't do much for us.
 
 ```{r}
 wss <- c()
-
+set.seed(1234)
 ## Test kmeans with 1 to 25 centers, keeping the WSS from each test
 for (i in 1:25) {
-  wss[i] <- sum(kmeans(pca.data[,pca.vars], centers=i, nstart = 25, iter.max = 1000)$withinss) 
+  wss[i] <- sum(kmeans(pca_data[,pca_vars], centers=i, nstart = 25, iter.max = 1000)$withinss) 
 }
 
-## Plot number of clusters and WSS, known as a scree plot
+## Plot number of clusters and WSS, looking for 'elbow'
 plot(1:25, wss, type="b", xlab="Number of Clusters", ylab="Within groups sum of squares")
 
 ```
 
 ### 6. Find optimal number of player clusters
 
-We can test the k-means using different number of clusters centers to find when the Within Group Sum of Squares (WSS) that best fit our PCs. To do this loop through 1 to 25 clusters measuring WSS. By definition add another cluster will lower WSS, so we look for the 'elbow' again where adding another cluster doesn't do much for us.
+While there is no extremely-sharp 'elbow' in the data, signifying a clear number of player-types in the last decade, there seems to be a slight bend at k=12 (sometimes data science is data art). This gives us a good number of clusters - certainly more interesting than trying to fit everyone into 3 clusters or coming up with names for 20 groups. Feel free to play around with this yourself if you like.
 
-```{r}
-# From scree plot elbow occurs at k = 11
-# Apply k-means with k=11
-k <- kmeans(comp, 11, nstart=25, iter.max=1000)
-library(RColorBrewer)
-library(scales)
-palette(alpha(brewer.pal(9,'Set1'), 0.5))
-plot(comp, col=as.factor(k$clust), pch=16) 
+![Before and after clustering in 2D separating into 3 clusters (now imagine 16D separating into 12 clusters)](https://i.stack.imgur.com/cIDB3.png)
+After clustering each player-season into 12 clusters, we can plot where each cluster falls within each of the PCs. It helps to visualize how clusters form, finding similar player-seasons in a multi-dimension space. Each color below represents a cluster. 
 
-```
+```{r, fig.width=16,fig.height=11}
+# From scree plot elbow occurs at k = 13
+# Apply k-means with k=13
+kmeans_object <- kmeans(comp, 12, nstart=25, iter.max=1000)
 
-### 6. Find optimal number of player clusters
-
-We can test the k-means using different number of clusters centers to find when the Within Group Sum of Squares (WSS) that best fit our PCs. To do this loop through 1 to 25 clusters measuring WSS. By definition add another cluster will lower WSS, so we look for the 'elbow' again where adding another cluster doesn't do much for us.
-
-```{r}
-# Cluster sizes
-Cluster = k$clust
-ClusterCenter = as.data.frame(k$centers)
-
-cluster.xwalk <- data.frame(cbind(Cluster,pca.data[,c("Player","Pos","shooterID", "season", "Predicted.CS")])) %>%
-                  mutate(Fwd = ifelse(Pos == "D",0,1)) %>% 
-                  group_by(Cluster) %>% 
-                  summarise(Predicted.CS = mean(Predicted.CS), 
-                            Fwd.Share = mean(Fwd), Count = n()) %>%
-                  mutate(Pos = ifelse(Fwd.Share < 0.15,"D",
-                               ifelse(Fwd.Share > 0.85,"F","Both"))) %>%
-                  arrange(Cluster) %>%
-                  cbind(ClusterCenter) %>%
-                  group_by(Pos) %>%
-                  mutate(ClusterRank = rank(-Predicted.CS),
-                         ClusterName = ifelse(Pos == "F" & ClusterRank == 1,"All-Around Skilled Offensive Driver",
-                                       ifelse(Pos == "D" & ClusterRank == 1,"All-Around Skilled Defensive Driver",
-                                              
-                                       ifelse(Pos == "F" & ClusterRank == 2,"Matchup Capable Skilled Offensive Driver",
-                                       ifelse(Pos == "D" & ClusterRank == 2,"Matchup Dependent Skilled Defensive Player",
-                                              
-                                       ifelse(Pos == "F" & ClusterRank == 3,"All-Around Matchup Capable Offensive Driver",
-                                       ifelse(Pos == "D" & ClusterRank == 3,"Matchup Capable Defensive Player",
-                                              
-                                       ifelse(Pos == "F" & ClusterRank == 4,"Matchup Capable Defensive Forward",
-                                       ifelse(Pos == "D" & ClusterRank == 4,"Matchup Dependent Defensive Depth",
-                                              
-                                       ifelse(Pos == "F" & ClusterRank == 5,"Matchup Capable Offensive Depth",
-                                       ifelse(Pos == "F" & ClusterRank == 6,"Defensive Depth",
-                                       ifelse(Pos == "F" & ClusterRank == 7,"Depth Defensive Forward","Defensive Depth"))))))))))))
-                                              
-
-# # First cluster
-# player.season.clusters <- pca.data %>% 
-#           select(Player, shooterID, season, Pos, Predicted.CS) %>%
-#           cbind(Cluster) %>%
-#           left_join(cluster.xwalk[, c("Cluster","ClusterName")], by = "Cluster") %>%
-#           mutate(Name = paste0(sapply(strsplit(as.character(Player), ' '), function(x) x[length(x)]))) %>% #,substr(season,7,8)))
-#             group_by(season, Pos) %>%
-#             mutate(Pos.Rank = rank(-Predicted.CS),
-#                    DepthChart = ifelse(Pos == "D" & Pos.Rank < 60,"1P D",
-#                            ifelse(Pos == "D" & Pos.Rank < 120,"2P D",
-#                            ifelse(Pos == "D" & Pos.Rank < 180,"3P D",
-#                            ifelse(Pos == "D","Other D",
-#                            ifelse(Pos != "D" & Pos.Rank < 90,"1L Fwd",
-#                            ifelse(Pos != "D" & Pos.Rank < 180,"2L Fwd",
-#                            ifelse(Pos != "D" & Pos.Rank < 270,"3L Fwd",
-#                            ifelse(Pos != "D" & Pos.Rank < 360,"4L Fwd",
-#                            ifelse(Pos != "D","Other Fwd","Other"))))))))))
-# 
-# talents <- player.season.clusters %>% mutate(Fwd = ifelse(Pos == "D",0,1)) %>% group_by(Cluster) %>% 
-#   summarise(Predicted.CS = mean(Predicted.CS), Fwd.Share = mean(Fwd), Count = n())
-# 
-# ### Join
-# crowdscout_data_predictions <- player.season.clusters %>%
-#           ungroup() %>%
-#           select(Player, shooterID,season,Cluster,ClusterName,Pos.Rank,DepthChart) %>%
-#           inner_join(crowdscout.data.pred.scaled, by = c("Player","shooterID","season")) %>%
-#           mutate(TOI = (TOI_EV + TOI_SH + TOI_PP)/ 3600,
-#                 G60 = ((G60_EV * (TOI_EV / 3600 )) + (G60_PP * (TOI_PP / 3600 )) + (G60_SH * (TOI_SH / 3600 ))) / TOI,
-#                 P60 = ((P60_EV * (TOI_EV / 3600 )) + (P60_PP * (TOI_PP / 3600 )) + (P60_SH * (TOI_SH / 3600 ))) / TOI)
+# Plot cluster by PC
+plot(comp, col=as.factor(kmeans_object$clust), pch=16) 
 
 ```
+
+### 7. Label each cluster
+
+Finally, we want to label each cluster to make them a little more accessible. I did this using a combination of methods.
+
+1. Looked at the players in each group, one has Crosby, another a fringe NHLer, etc
+2. Looked at share of forwards in each cluster and mean CrowdScout Score (proxy for talent)
+3. Looked at the PCs that make up the cluster center. Each of these PCs are made up of original metrics as we saw in the component loadings above. 
+
+So, for example, we see cluster 12 maps to Ovechkin, Kane, and Malkin. We also see in the 'cluster_xwalk' below it is relatively overweight looking at PC1 (+4). Looking at the component loadings above, we see PC1 is positively correlated with scoring and PP time, so this cluster likely has many offensive weapons. 
+
+In order to generalize, I ranked talent levels by position, noticing that clusters that are high scoring or skilled cohorts are rated highly (my predicted CrowdScout Score is <a href="http://www.crowdscoutsports.com/game-theory/the-path-to-war/">built on user scouting inputs, and even the best fanalysts are more likely to observe offense than defense</a>). The best clusters were made up of productive 'Skilled' players that were seemingly ability to 'Drive' team xG metrics and played in 'All-Situations.' The 2nd and 3rd highest skilled groups were termed 'Favorable-Situation' because they generally had a higher share of powerplay time and results and a lower share of shorthanded time and results. Further down, xG relative to team and usage often signalled sheltering or 'Depth'-type players.
+
+This is to say, you may want to read these cluster labels not as an air tight law of nature, rather what they represent relative to the other clusters. 
+
+```{r}
+
+# Vector of player clusters from 'kmeans_object' object
+Cluster = kmeans_object$clust
+
+# Print PCs (13 columns) making up each cluster (13 rows)
+cluster_center = as.data.frame(kmeans_object$centers)
+print(cluster_center)
+
+# Join clusters to player season data
+player_season_clusters <- data.frame(cbind(Cluster,pca_data[,c("Player","Pos","shooterID", "season", "Predicted.CS")])) 
+
+# Print top 3 examples of each cluster
+player_season_clusters %>% arrange(-Cluster) %>% group_by(Cluster) %>% top_n(3) %>% print()
+
+## Create cluster name / number crosswalk
+cluster_xwalk <- player_season_clusters %>%
+          mutate(Fwd = ifelse(Pos == "D",0,1)) %>% 
+          # Summarise data to cluster level, calculating mean talent, share of forwards, and sample size
+          group_by(Cluster) %>% 
+          summarise(Mean.Predicted.CS = mean(Predicted.CS), 
+                    SD.Predicted.CS = sd(Predicted.CS), 
+                    Fwd.Share = mean(Fwd), Count = n()) %>%
+          # Determine positional makeup of each cluster  
+          mutate(Pos = ifelse(Fwd.Share < 0.15,"D",
+                       ifelse(Fwd.Share > 0.85,"F","Both"))) %>%
+          # Join cluster centers to data
+          arrange(Cluster) %>%
+          cbind(cluster_center) %>%
+          # Rank cluster talent by position, and create names based on rules
+          group_by(Pos) %>%
+          # I developed these rules as cluster numbers may change, based on sample players and how the prominent PCs in each cluster map the eigenvalues back to the original metrics
+          mutate(ClusterRank = rank(-Mean.Predicted.CS),
+                 ClusterName = 
+                     ifelse(Pos == "F" & ClusterRank == 1,
+                            "Skilled All-Situation Offensive Driver",
+                     ifelse(Pos == "D" & ClusterRank == 1,
+                            "Skilled All-Situation Defensive Driver",
+                            
+                     ifelse(Pos == "F" & ClusterRank == 2,
+                            "Shooting Favorable-Situation Offensive Driver",
+                     ifelse(Pos == "D" & ClusterRank == 2,
+                            "Skilled Favorable-Situation Defensive Player",
+                            
+                     ifelse(Pos == "F" & ClusterRank == 3,
+                            "Skilled Favorable-Situation Offensive Driver",
+                     ifelse(Pos == "D" & ClusterRank == 3,
+                            "All-Situation Defensive Player",
+                            
+                     ifelse(Pos == "F" & ClusterRank == 4,
+                            "All-Situation Defensive Forward",
+                     ifelse(Pos == "D" & ClusterRank == 4,
+                            "Favorable-Situation Defensive Depth",
+                            
+                     ifelse(Pos == "F" & ClusterRank == 5,
+                            "Favorable-Situation Offensive Depth",
+                     ifelse(Pos == "F" & ClusterRank == 6,
+                            "Favorable-Situation Offensive Depth",
+                     ifelse(Pos == "F" & ClusterRank == 7,
+                            "Utility Depth",
+                            "Utility Depth"))))))))))))
+                                              
+
+# Join crosswalk to data and rank skill by position, creating depth chart ranking and cluster
+player_season_clusters <- pca_data[,c("Player","shooterID","season","Pos","Predicted.CS")] %>%
+          # Join cluster and cluster names
+          cbind(Cluster) %>%
+          left_join(cluster_xwalk[, c("Cluster","ClusterName")], by = "Cluster") %>%
+          mutate(Name = paste0(sapply(strsplit(as.character(Player), ' '), function(x) x[length(x)]))) %>%
+          # Rank players by position and create league ranking
+            group_by(season, Pos) %>%
+            mutate(Pos.Rank = rank(-Predicted.CS),
+                   DepthChart = ifelse(Pos == "D" & Pos.Rank < 60,"1P D",
+                           ifelse(Pos == "D" & Pos.Rank < 120,"2P D",
+                           ifelse(Pos == "D" & Pos.Rank < 180,"3P D",
+                           ifelse(Pos == "D","Other D",
+                           ifelse(Pos != "D" & Pos.Rank < 90,"1L Fwd",
+                           ifelse(Pos != "D" & Pos.Rank < 180,"2L Fwd",
+                           ifelse(Pos != "D" & Pos.Rank < 270,"3L Fwd",
+                           ifelse(Pos != "D" & Pos.Rank < 360,"4L Fwd",
+                           ifelse(Pos != "D","Other Fwd","Other"))))))))))
+ 
+```
+
+### 8. Create function to plot player by cluster, season, ability, and positional ranking
+
+Create a function that creates a plot for all player seasons estimated ability and player, labelling select players. I chose to display:
+
+1. Alex Ovechkin because he's awesome
+2. Mark Scheifele because a) he's had one of the more interesting ascents in the dataset, jumping around clusters as he matured and b) I need practice spelling his name
+3. Mikael Backlund because he also had an interesting development arc. 
+
+Now you can add any player name to the plot_players_cluster_function() function and plot their cluster and ability by season.
+
+```{r, fig.width=16,fig.height=11}
+
+
+plot_players_cluster_function <- function(player_list, seasons=c("20072008","20082009","20092010","20102011","20112012","20122013","20132014","20142015","20152016","20162017")) {
+
+plot <- player_season_clusters %>%
+    ## Limit to season in function list
+    filter(season %in% seasons) %>%
+    ## Display only players in player list
+    mutate(PlayerListed = ifelse(Player %in% player_list,paste0(Player,substr(season,7,8)),NA)) %>%
+    ## Plot
+    ggplot(aes(y=Predicted.CS,x=reorder(ClusterName,-Predicted.CS), color=as.factor(DepthChart), shape=as.factor(Pos), 
+               label=PlayerListed, color=as.factor(ClusterName)), size=20) +
+    geom_point(size=5, alpha=0.5) +
+    geom_label(color = 'grey50') +
+    guides(colour = guide_legend(override.aes = list(size=8))) +
+    labs(title = paste0(paste(player_list, sep=",", collapse=", "),"\nClusters and Estimated Ability by Season, data from www.crowdscoutsports.com"), y="Predicted CrowdScout Score (0-100)", shape="Position",color="Depth Chart",x="") +
+    theme_standard() + 
+    scale_color_discrete()
+
+return(plot)
+}
+
+plot_players_cluster_function(c("ALEX OVECHKIN"), c("20142015","20152016","20162017"))
+
+plot_players_cluster_function(c("MARK SCHEIFELE"))
+
+plot_players_cluster_function(c("MIKAEL BACKLUND"))
+```
+
+### 9. Next steps
+
+Clustering is fun but doesn't really reveal too much on its own. However, this is a precursor to a Player Similarity Analysis I am completing (and will publish in a similar way, producing a Jupyter Notebook with commentary, instead of a traditional blog post). Knowing how a player is deployed and the type of results they generally create of course helps this exercise. This has more interesting applications like projecting future performance based on comparable players and their future performance.
+
+Additional research can also use these player archetypes predict shift, game, or season-level results. 
